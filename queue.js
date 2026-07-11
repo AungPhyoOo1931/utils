@@ -3,14 +3,12 @@
  *
  * 全局单例，整个项目只初始化一次，到处 import send 直接用。
  *
- * 主项目依赖：npm install ioredis
- *
  * ── 项目入口初始化一次（推荐）──
- *   import { init, send } from './utils/index.js';
+ *   import { init, send } from 'telegram-send-queue';
  *   init({ redis: process.env.REDIS_URL });
  *
  * ── 任何地方发消息 ──
- *   import { send } from './utils/index.js';
+ *   import { send } from 'telegram-send-queue';
  *   await send.push(chatId, 'sendMessage', { text: '你好' });
  *   await send.push(chatId, 'sendPhoto', { photo: fileId, caption: '说明' });
  *
@@ -21,8 +19,8 @@
  *     console.error(err.message); // 入队失败 / 发送失败 / 超时
  *   }
  *
- * ── 只入队不等结果 ──
- *   await send.push(chatId, 'sendMessage', { text: 'hi' }, { wait: false });
+ * ── 多账户指定 bot ──
+ *   await send.push(chatId, 'sendMessage', { text: 'hi' }, { bot: 'account2' });
  */
 
 import { randomUUID } from 'node:crypto';
@@ -34,16 +32,18 @@ const DONE_TTL_SEC = 60;
 
 let client = null;
 let defaultWait = true;
-let initRedis = null; // 记录首次配置，用于检测重复 init
+let defaultBot = 'default';
+let initRedis = null;
 
 /**
  * 项目入口调用一次。
  * 重复调用不会覆盖已有连接，第二次及以后会 warn 并直接 return。
  * @param {object} opts
  * @param {string|object} opts.redis  - Redis 连接，如 process.env.REDIS_URL
- * @param {boolean}     opts.wait     - 默认是否等待发送完成，默认 true
+ * @param {boolean}     opts.wait       - 默认是否等待发送完成，默认 true
+ * @param {string}      opts.defaultBot - 默认 bot 账户 key，默认 'default'
  */
-export function init({ redis, wait = true } = {}) {
+export function init({ redis, wait = true, defaultBot: bot = 'default' } = {}) {
   const url = redis ?? process.env.REDIS_URL;
 
   // 已初始化：不覆盖，不新建连接，之前 push 过的任务不受影响
@@ -70,6 +70,7 @@ export function init({ redis, wait = true } = {}) {
 
   initRedis = url;
   defaultWait = wait;
+  defaultBot = bot;
 }
 
 function ensureClient() {
@@ -83,12 +84,14 @@ function ensureClient() {
  * @param {string}        method   - sendMessage / sendPhoto / sendDocument ...
  * @param {object}        params   - 方法参数（chat_id 不用写）
  * @param {object}        opts
- * @param {boolean}       opts.wait
+ * @param {boolean}       opts.wait  - 是否等待发送完成
+ * @param {string}        opts.bot   - 用哪个账户发（对应 startWorker 的 bots key）
  */
 async function push(chatId, method, params = {}, opts = {}) {
   const redis = ensureClient();
   const taskId = randomUUID();
-  const task = JSON.stringify({ id: taskId, chatId, method, params });
+  const bot = opts.bot ?? defaultBot;
+  const task = JSON.stringify({ id: taskId, chatId, method, params, bot });
   const shouldWait = opts.wait ?? defaultWait;
 
   try {

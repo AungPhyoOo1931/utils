@@ -1,59 +1,140 @@
 /**
- * Telegram 发送队列 — 消费者（单独一个进程跑）
+ * Telegram 发送队列 — 消费者
  *
- * 原理：循环从 Redis 列表 RPOP 取任务 → 调 Telegram API 发送 → 回写结果。
+ * 推荐：在项目里 new Bot()，把 bot.api 传进来（共用同一份 grammY，无重复实例问题）
  *
- * 主项目依赖（在主项目里 npm install，这里不装）：
- *   npm install ioredis grammy
+ * ── 单账户 ──
+ *   const bot = new Bot(process.env.BOT_TOKEN);
+ *   startWorker({ redis: process.env.REDIS_URL, api: bot.api });
  *
- * 用法：
- *   import { startWorker } from './utils/worker.js';
- *
+ * ── 多账户轮询 ──
+ *   const bot1 = new Bot(process.env.BOT_TOKEN_1);
+ *   const bot2 = new Bot(process.env.BOT_TOKEN_2);
  *   startWorker({
- *     botToken: process.env.BOT_TOKEN,
- *     redis: 'redis://127.0.0.1:6379',
+ *     redis: process.env.REDIS_URL,
+ *     bots: { account1: bot1.api, account2: bot2.api },
+ *     defaultBot: 'account1',
  *   });
+ *   await send.push(chatId, 'sendMessage', { text: 'hi' }, { bot: 'account2' });
  *
- *   // 然后另开终端跑你的 Bot 就行
+ * ── Worker 独立进程（无法传 JS 对象，改传 tokens）──
+ *   startWorker({
+ *     redis: process.env.REDIS_URL,
+ *     tokens: { account1: process.env.BOT_TOKEN_1, account2: process.env.BOT_TOKEN_2 },
+ *     defaultBot: 'account1',
+ *   });
  */
 
+import { createRequire } from 'node:module';
 import Redis from 'ioredis';
-import { Api } from 'grammy';
+
+const require = createRequire(import.meta.url);
 
 const QUEUE_KEY = 'tg:send:queue';
 const DONE_PREFIX = 'tg:send:done:';
 const DONE_TTL_SEC = 60;
-const CHAT_INTERVAL_MS = 1000; // 同一 chat 最少间隔 1 秒，防 Telegram 限流
+const CHAT_INTERVAL_MS = 1000;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** 用 tokens 时才加载 grammY，避免模块里多装一份 */
+function createApiFromToken(token) {
+  let Api;
+  try {
+    Api = require('grammy').Api;
+  } catch {
+    throw new Error(
+      '使用 tokens/botToken 模式需要安装 grammy：npm install grammy',
+    );
+  }
+  return new Api(token);
+}
+
 /**
- * 启动发送 Worker（阻塞式，一般作为独立进程入口）
+ * 组装 bot 实例表
+ * @returns {Map<string, object>} botKey → api 实例
  */
-export function startWorker({ botToken, redis, chatIntervalMs = CHAT_INTERVAL_MS }) {
-  if (!botToken) throw new Error('botToken 必填');
+function buildBotMap({ api, bots, tokens, botToken }) {
+  const map = new Map();
+
+  if (api) map.set('default', api);
+
+  if (bots) {
+    for (const [key, instance] of Object.entries(bots)) {
+      map.set(key, instance);
+    }
+  }
+
+  if (tokens) {
+    for (const [key, token] of Object.entries(tokens)) {
+      map.set(key, createApiFromToken(token));
+    }
+  }
+
+  if (botToken && map.size === 0) {
+    map.set('default', createApiFromToken(botToken));
+  }
+
+  if (map.size === 0) {
+    throw new Error(
+      'startWorker 需要 api / bots / tokens / botToken 至少提供一个',
+    );
+  }
+
+  return map;
+}
+
+/**
+ * @param {object} opts
+ * @param {string|object} opts.redis
+ * @param {object}  [opts.api]         - 单个 bot.api（项目里 new Bot 后传入）
+ * @param {object}  [opts.bots]        - 多账户：{ account1: bot1.api, account2: bot2.api }
+ * @param {object}  [opts.tokens]      - 独立进程用：{ account1: 'token...', account2: 'token...' }
+ * @param {string}  [opts.botToken]    - 单 token 简写（CLI 用）
+ * @param {string}  [opts.defaultBot]  - 默认账户 key，默认 'default'
+ * @param {number}  [opts.chatIntervalMs]
+ */
+export function startWorker({
+  redis,
+  api,
+  bots,
+  tokens,
+  botToken,
+  defaultBot = 'default',
+  chatIntervalMs = CHAT_INTERVAL_MS,
+}) {
   if (!redis) throw new Error('redis 必填');
 
+  const botMap = buildBotMap({ api, bots, tokens, botToken });
   const client = new Redis(redis);
-  const api = new Api(botToken);
-  const lastSent = new Map(); // chatId → 上次发送时间戳
+  const lastSent = new Map(); // "botKey:chatId" → timestamp
 
-  console.log('[send-worker] 已启动，等待任务...');
+  function getApi(botKey) {
+    const key = botKey ?? defaultBot;
+    const instance = botMap.get(key);
+    if (!instance) {
+      throw new Error(`未注册的 bot: ${key}，可用: ${[...botMap.keys()].join(', ')}`);
+    }
+    return instance;
+  }
 
-  // 主循环
+  console.log(
+    `[send-worker] 已启动，账户: ${[...botMap.keys()].join(', ')}，默认: ${defaultBot}`,
+  );
+
   (async () => {
     while (true) {
-      // 阻塞等待任务（BRPOP：列表为空时挂起，有任务立刻返回）
       const item = await client.brpop(QUEUE_KEY, 0);
       if (!item) continue;
 
       const task = JSON.parse(item[1]);
-      const { id, chatId, method, params } = task;
+      const { id, chatId, method, params, bot: taskBot } = task;
+      const botKey = taskBot ?? defaultBot;
+      const rateKey = `${botKey}:${chatId}`;
 
-      // 单 chat 限流：距上次发送不足 interval 就等一等
-      const last = lastSent.get(chatId) ?? 0;
+      const last = lastSent.get(rateKey) ?? 0;
       const gap = chatIntervalMs - (Date.now() - last);
       if (gap > 0) await sleep(gap);
 
@@ -61,28 +142,32 @@ export function startWorker({ botToken, redis, chatIntervalMs = CHAT_INTERVAL_MS
       let error = null;
       let detail = null;
 
-      // 发送，429 限流时原地重试
       for (let attempt = 0; attempt < 5; attempt++) {
         try {
-          result = await callApi(api, method, chatId, params);
-          lastSent.set(chatId, Date.now());
+          const apiInstance = getApi(botKey);
+          result = await callApi(apiInstance, method, chatId, params);
+          lastSent.set(rateKey, Date.now());
           error = null;
           break;
         } catch (err) {
           if (err.error_code === 429 && attempt < 4) {
             const sec = err.parameters?.retry_after ?? 3;
-            console.log(`[send-worker] 被限流，${sec}s 后重试 (${attempt + 1}/5)`);
+            console.log(
+              `[send-worker] [${botKey}] 被限流，${sec}s 后重试 (${attempt + 1}/5)`,
+            );
             await sleep(sec * 1000);
             continue;
           }
           error = err.message ?? String(err);
           detail = err;
-          console.error(`[send-worker] 发送失败 [${method}] chat=${chatId}:`, error);
+          console.error(
+            `[send-worker] [${botKey}] 发送失败 [${method}] chat=${chatId}:`,
+            error,
+          );
           break;
         }
       }
 
-      // 回写结果，让 push() 端的 BRPOP 收到
       const doneKey = `${DONE_PREFIX}${id}`;
       await client.lpush(
         doneKey,
@@ -95,7 +180,6 @@ export function startWorker({ botToken, redis, chatIntervalMs = CHAT_INTERVAL_MS
     process.exit(1);
   });
 
-  // 优雅退出
   const shutdown = async () => {
     console.log('[send-worker] 正在关闭...');
     await client.quit();
@@ -105,75 +189,83 @@ export function startWorker({ botToken, redis, chatIntervalMs = CHAT_INTERVAL_MS
   process.once('SIGTERM', shutdown);
 }
 
-/**
- * 根据 method 名自动拼参数调用 Api
- * grammY 的方法签名大多是 (chatId, ...args, options?)
- */
 async function callApi(api, method, chatId, params) {
   const fn = api[method];
+  if (typeof fn !== 'function' && !api.raw?.[method]) {
+    throw new Error(`未知的 API 方法: ${method}`);
+  }
 
   switch (method) {
     case 'sendMessage':
-      return fn.call(api, chatId, params.text, rest(params, 'text'));
-
+      return api.sendMessage(chatId, params.text, rest(params, 'text'));
     case 'sendPhoto':
-      return fn.call(api, chatId, params.photo, rest(params, 'photo'));
-
+      return api.sendPhoto(chatId, params.photo, rest(params, 'photo'));
     case 'sendDocument':
-      return fn.call(api, chatId, params.document, rest(params, 'document'));
-
+      return api.sendDocument(chatId, params.document, rest(params, 'document'));
     case 'sendVideo':
-      return fn.call(api, chatId, params.video, rest(params, 'video'));
-
+      return api.sendVideo(chatId, params.video, rest(params, 'video'));
     case 'sendAudio':
-      return fn.call(api, chatId, params.audio, rest(params, 'audio'));
-
+      return api.sendAudio(chatId, params.audio, rest(params, 'audio'));
     case 'sendVoice':
-      return fn.call(api, chatId, params.voice, rest(params, 'voice'));
-
+      return api.sendVoice(chatId, params.voice, rest(params, 'voice'));
     case 'sendSticker':
-      return fn.call(api, chatId, params.sticker, rest(params, 'sticker'));
-
+      return api.sendSticker(chatId, params.sticker, rest(params, 'sticker'));
     case 'sendAnimation':
-      return fn.call(api, chatId, params.animation, rest(params, 'animation'));
-
+      return api.sendAnimation(chatId, params.animation, rest(params, 'animation'));
     case 'sendLocation':
-      return fn.call(api, chatId, params.latitude, params.longitude, rest(params, 'latitude', 'longitude'));
-
+      return api.sendLocation(
+        chatId,
+        params.latitude,
+        params.longitude,
+        rest(params, 'latitude', 'longitude'),
+      );
     case 'sendPoll':
-      return fn.call(api, chatId, params.question, params.options, rest(params, 'question', 'options'));
-
+      return api.sendPoll(
+        chatId,
+        params.question,
+        params.options,
+        rest(params, 'question', 'options'),
+      );
     case 'sendDice':
-      return fn.call(api, chatId, params.emoji ?? '🎲', rest(params, 'emoji'));
-
+      return api.sendDice(chatId, params.emoji ?? '🎲', rest(params, 'emoji'));
     case 'sendMediaGroup':
-      return fn.call(api, chatId, params.media, rest(params, 'media'));
-
+      return api.sendMediaGroup(chatId, params.media, rest(params, 'media'));
     case 'sendChatAction':
-      return fn.call(api, chatId, params.action, rest(params, 'action'));
-
+      return api.sendChatAction(chatId, params.action, rest(params, 'action'));
     case 'editMessageText':
-      return fn.call(api, chatId, params.message_id, params.text, rest(params, 'message_id', 'text'));
-
+      return api.editMessageText(
+        chatId,
+        params.message_id,
+        params.text,
+        rest(params, 'message_id', 'text'),
+      );
     case 'editMessageCaption':
-      return fn.call(api, chatId, params.message_id, rest(params, 'message_id'));
-
+      return api.editMessageCaption(
+        chatId,
+        params.message_id,
+        rest(params, 'message_id'),
+      );
     case 'deleteMessage':
-      return fn.call(api, chatId, params.message_id);
-
+      return api.deleteMessage(chatId, params.message_id);
     case 'copyMessage':
-      return fn.call(api, chatId, params.from_chat_id, params.message_id, rest(params, 'from_chat_id', 'message_id'));
-
+      return api.copyMessage(
+        chatId,
+        params.from_chat_id,
+        params.message_id,
+        rest(params, 'from_chat_id', 'message_id'),
+      );
     case 'forwardMessage':
-      return fn.call(api, chatId, params.from_chat_id, params.message_id, rest(params, 'from_chat_id', 'message_id'));
-
+      return api.forwardMessage(
+        chatId,
+        params.from_chat_id,
+        params.message_id,
+        rest(params, 'from_chat_id', 'message_id'),
+      );
     default:
-      // 兜底：把 params 原样展开，加上 chat_id
       return api.raw[method].call(api.raw, { chat_id: chatId, ...params });
   }
 }
 
-/** 去掉已单独传的主参数，剩下当 options */
 function rest(obj, ...keys) {
   const out = { ...obj };
   for (const k of keys) delete out[k];
