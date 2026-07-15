@@ -1,34 +1,22 @@
 /**
  * Telegram 发送队列 — 生产者
  *
- * 全局单例，整个项目只初始化一次，到处 import send 直接用。
- *
- * ── 项目入口初始化一次（推荐）──
- *   import { init, send } from 'telegram-send-queue';
- *   init({ redis: process.env.REDIS_URL });
- *
- * ── 任何地方发消息 ──
- *   import { send } from 'telegram-send-queue';
- *   await send.push(chatId, 'sendMessage', { text: '你好' });
- *   await send.push(chatId, 'sendPhoto', { photo: fileId, caption: '说明' });
- *
- * ── 错误处理 ──
- *   try {
- *     const msg = await send.push(chatId, 'sendMessage', { text: 'hi' });
- *   } catch (err) {
- *     console.error(err.message); // 入队失败 / 发送失败 / 超时
- *   }
- *
- * ── 多账户指定 bot ──
- *   await send.push(chatId, 'sendMessage', { text: 'hi' }, { bot: 'account2' });
+ * init 选项：
+ *   maxPendingPerChat - 单 chat 最多几条待发，默认 3，0=不限制
+ *   dropOld           - 同 chat 新消息覆盖旧的，默认 false
  */
 
 import { randomUUID } from 'node:crypto';
 import Redis from 'ioredis';
-
-const QUEUE_KEY = 'tg:send:queue';
-const DONE_PREFIX = 'tg:send:done:';
-const DONE_TTL_SEC = 60;
+import {
+  CONFIG_KEY,
+  DEFAULT_MAX_PENDING_PER_CHAT,
+  DONE_TTL_SEC,
+  QUEUE_KEY,
+  doneKey,
+  latestKey,
+  pendingKey,
+} from './keys.js';
 
 let client = null;
 let defaultWait = true;
@@ -36,17 +24,22 @@ let defaultBot = 'default';
 let initRedis = null;
 
 /**
- * 项目入口调用一次。
- * 重复调用不会覆盖已有连接，第二次及以后会 warn 并直接 return。
  * @param {object} opts
- * @param {string|object} opts.redis  - Redis 连接，如 process.env.REDIS_URL
- * @param {boolean}     opts.wait       - 默认是否等待发送完成，默认 true
- * @param {string}      opts.defaultBot - 默认 bot 账户 key，默认 'default'
+ * @param {string|object} opts.redis
+ * @param {boolean}     [opts.wait=true]
+ * @param {string}      [opts.defaultBot='default']
+ * @param {number}      [opts.maxPendingPerChat=3]  单 chat 最大待发数，0=不限制
+ * @param {boolean}     [opts.dropOld=false]         同 chat 只发最新一条
  */
-export function init({ redis, wait = true, defaultBot: bot = 'default' } = {}) {
+export function init({
+  redis,
+  wait = true,
+  defaultBot: bot = 'default',
+  maxPendingPerChat = DEFAULT_MAX_PENDING_PER_CHAT,
+  dropOld = false,
+} = {}) {
   const url = redis ?? process.env.REDIS_URL;
 
-  // 已初始化：不覆盖，不新建连接，之前 push 过的任务不受影响
   if (client) {
     const sameRedis =
       url === initRedis ||
@@ -71,6 +64,15 @@ export function init({ redis, wait = true, defaultBot: bot = 'default' } = {}) {
   initRedis = url;
   defaultWait = wait;
   defaultBot = bot;
+
+  client
+    .set(
+      CONFIG_KEY,
+      JSON.stringify({ maxPendingPerChat, dropOld }),
+    )
+    .catch((err) => {
+      console.warn('[send] 写入配置失败:', err.message);
+    });
 }
 
 function ensureClient() {
@@ -78,36 +80,72 @@ function ensureClient() {
   return client;
 }
 
+async function readConfig(redis) {
+  try {
+    const raw = await redis.get(CONFIG_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {
+    // ignore
+  }
+  return {
+    maxPendingPerChat: DEFAULT_MAX_PENDING_PER_CHAT,
+    dropOld: false,
+  };
+}
+
 /**
- * 投递一条发送任务
- * @param {number|string} chatId
- * @param {string}        method   - sendMessage / sendPhoto / sendDocument ...
- * @param {object}        params   - 方法参数（chat_id 不用写）
- * @param {object}        opts
- * @param {boolean}       opts.wait  - 是否等待发送完成
- * @param {string}        opts.bot   - 用哪个账户发（对应 startWorker 的 bots key）
+ * @param {object} [opts]
+ * @param {boolean} [opts.wait]
+ * @param {string}  [opts.bot]
  */
 async function push(chatId, method, params = {}, opts = {}) {
   const redis = ensureClient();
+  const config = await readConfig(redis);
   const taskId = randomUUID();
   const bot = opts.bot ?? defaultBot;
-  const task = JSON.stringify({ id: taskId, chatId, method, params, bot });
   const shouldWait = opts.wait ?? defaultWait;
+  const pKey = pendingKey(bot, chatId);
+
+  // 单 chat 待发上限
+  if (config.maxPendingPerChat > 0) {
+    const count = await redis.incr(pKey);
+    if (count > config.maxPendingPerChat) {
+      await redis.decr(pKey);
+      const err = new Error(
+        `发送队列已满（单 chat 最多 ${config.maxPendingPerChat} 条待发），请稍后再试`,
+      );
+      err.code = 'QUEUE_FULL';
+      throw err;
+    }
+  }
+
+  // 只保留最新：标记当前 taskId，旧任务由 Worker 跳过
+  if (config.dropOld) {
+    await redis.set(latestKey(bot, chatId), taskId);
+  }
+
+  const task = JSON.stringify({ id: taskId, chatId, method, params, bot });
 
   try {
     await redis.lpush(QUEUE_KEY, task);
   } catch (err) {
+    if (config.maxPendingPerChat > 0) {
+      await redis.decr(pKey).catch(() => {});
+    }
     throw new Error(`入队失败: ${err.message}`);
   }
 
   if (!shouldWait) return taskId;
 
-  const reply = await redis.brpop(`${DONE_PREFIX}${taskId}`, 30);
+  const reply = await redis.brpop(doneKey(taskId), 30);
   if (!reply) {
     throw new Error('发送超时（30s），请确认 Worker 是否在运行');
   }
 
   const data = JSON.parse(reply[1]);
+  if (data.skipped) {
+    return null;
+  }
   if (data.error) {
     const err = new Error(data.error);
     err.cause = data.detail;
@@ -124,5 +162,4 @@ async function close() {
   }
 }
 
-/** 全局发送实例，直接 send.push() 即可 */
 export const send = { push, close };

@@ -1,45 +1,29 @@
 /**
  * Telegram 发送队列 — 消费者
  *
- * 推荐：在项目里 new Bot()，把 bot.api 传进来（共用同一份 grammY，无重复实例问题）
- *
- * ── 单账户 ──
- *   const bot = new Bot(process.env.BOT_TOKEN);
- *   startWorker({ redis: process.env.REDIS_URL, api: bot.api });
- *
- * ── 多账户轮询 ──
- *   const bot1 = new Bot(process.env.BOT_TOKEN_1);
- *   const bot2 = new Bot(process.env.BOT_TOKEN_2);
- *   startWorker({
- *     redis: process.env.REDIS_URL,
- *     bots: { account1: bot1.api, account2: bot2.api },
- *     defaultBot: 'account1',
- *   });
- *   await send.push(chatId, 'sendMessage', { text: 'hi' }, { bot: 'account2' });
- *
- * ── Worker 独立进程（无法传 JS 对象，改传 tokens）──
- *   startWorker({
- *     redis: process.env.REDIS_URL,
- *     tokens: { account1: process.env.BOT_TOKEN_1, account2: process.env.BOT_TOKEN_2 },
- *     defaultBot: 'account1',
- *   });
+ * 公平调度：某 chat 在冷却期内不阻塞全局，任务进延迟队列，先处理其他用户。
  */
 
 import { createRequire } from 'node:module';
 import Redis from 'ioredis';
+import {
+  CONFIG_KEY,
+  DEFAULT_MAX_PENDING_PER_CHAT,
+  DELAY_KEY,
+  DONE_TTL_SEC,
+  QUEUE_KEY,
+  doneKey,
+  latestKey,
+  pendingKey,
+} from './keys.js';
 
 const require = createRequire(import.meta.url);
-
-const QUEUE_KEY = 'tg:send:queue';
-const DONE_PREFIX = 'tg:send:done:';
-const DONE_TTL_SEC = 60;
 const CHAT_INTERVAL_MS = 1000;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** 用 tokens 时才加载 grammY，避免模块里多装一份 */
 function createApiFromToken(token) {
   let Api;
   try {
@@ -52,10 +36,6 @@ function createApiFromToken(token) {
   return new Api(token);
 }
 
-/**
- * 组装 bot 实例表
- * @returns {Map<string, object>} botKey → api 实例
- */
 function buildBotMap({ api, bots, tokens, botToken }) {
   const map = new Map();
 
@@ -86,16 +66,52 @@ function buildBotMap({ api, bots, tokens, botToken }) {
   return map;
 }
 
-/**
- * @param {object} opts
- * @param {string|object} opts.redis
- * @param {object}  [opts.api]         - 单个 bot.api（项目里 new Bot 后传入）
- * @param {object}  [opts.bots]        - 多账户：{ account1: bot1.api, account2: bot2.api }
- * @param {object}  [opts.tokens]      - 独立进程用：{ account1: 'token...', account2: 'token...' }
- * @param {string}  [opts.botToken]    - 单 token 简写（CLI 用）
- * @param {string}  [opts.defaultBot]  - 默认账户 key，默认 'default'
- * @param {number}  [opts.chatIntervalMs]
- */
+async function readConfig(client) {
+  try {
+    const raw = await client.get(CONFIG_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {
+    // ignore
+  }
+  return {
+    maxPendingPerChat: DEFAULT_MAX_PENDING_PER_CHAT,
+    dropOld: false,
+  };
+}
+
+/** 从主队列或延迟队列取一条任务 */
+async function takeNextTask(client) {
+  const now = Date.now();
+  const delayed = await client.zrangebyscore(DELAY_KEY, 0, now, 'LIMIT', 0, 1);
+  if (delayed.length > 0) {
+    const removed = await client.zrem(DELAY_KEY, delayed[0]);
+    if (removed) return delayed[0];
+  }
+
+  const item = await client.brpop(QUEUE_KEY, 1);
+  return item ? item[1] : null;
+}
+
+async function finishTask(client, config, { id, botKey, chatId, result, error, detail, skipped }) {
+  if (config.maxPendingPerChat > 0) {
+    const pKey = pendingKey(botKey, chatId);
+    const n = await client.decr(pKey);
+    if (n < 0) await client.set(pKey, '0');
+  }
+
+  const key = doneKey(id);
+  await client.lpush(
+    key,
+    JSON.stringify({
+      result: skipped ? null : result,
+      error: skipped ? null : error,
+      detail: error ? String(detail) : null,
+      skipped: !!skipped,
+    }),
+  );
+  await client.expire(key, DONE_TTL_SEC);
+}
+
 export function startWorker({
   redis,
   api,
@@ -109,13 +125,15 @@ export function startWorker({
 
   const botMap = buildBotMap({ api, bots, tokens, botToken });
   const client = new Redis(redis);
-  const lastSent = new Map(); // "botKey:chatId" → timestamp
+  const lastSent = new Map();
 
   function getApi(botKey) {
     const key = botKey ?? defaultBot;
     const instance = botMap.get(key);
     if (!instance) {
-      throw new Error(`未注册的 bot: ${key}，可用: ${[...botMap.keys()].join(', ')}`);
+      throw new Error(
+        `未注册的 bot: ${key}，可用: ${[...botMap.keys()].join(', ')}`,
+      );
     }
     return instance;
   }
@@ -126,17 +144,36 @@ export function startWorker({
 
   (async () => {
     while (true) {
-      const item = await client.brpop(QUEUE_KEY, 0);
-      if (!item) continue;
+      const config = await readConfig(client);
+      const raw = await takeNextTask(client);
+      if (!raw) continue;
 
-      const task = JSON.parse(item[1]);
+      const task = JSON.parse(raw);
       const { id, chatId, method, params, bot: taskBot } = task;
       const botKey = taskBot ?? defaultBot;
       const rateKey = `${botKey}:${chatId}`;
 
+      // dropOld：已被更新的任务直接跳过
+      if (config.dropOld) {
+        const latest = await client.get(latestKey(botKey, chatId));
+        if (latest && latest !== id) {
+          await finishTask(client, config, {
+            id,
+            botKey,
+            chatId,
+            skipped: true,
+          });
+          continue;
+        }
+      }
+
+      // 公平调度：冷却中 → 进延迟队列，不阻塞其他 chat
       const last = lastSent.get(rateKey) ?? 0;
       const gap = chatIntervalMs - (Date.now() - last);
-      if (gap > 0) await sleep(gap);
+      if (gap > 0) {
+        await client.zadd(DELAY_KEY, Date.now() + gap, raw);
+        continue;
+      }
 
       let result = null;
       let error = null;
@@ -168,12 +205,14 @@ export function startWorker({
         }
       }
 
-      const doneKey = `${DONE_PREFIX}${id}`;
-      await client.lpush(
-        doneKey,
-        JSON.stringify({ result, error, detail: error ? String(detail) : null }),
-      );
-      await client.expire(doneKey, DONE_TTL_SEC);
+      await finishTask(client, config, {
+        id,
+        botKey,
+        chatId,
+        result,
+        error,
+        detail,
+      });
     }
   })().catch((err) => {
     console.error('[send-worker] 循环异常退出:', err);
